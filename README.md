@@ -2,6 +2,12 @@
 
 A production-grade brain & body orchestration skill for [Claude Code](https://claude.ai/code). Keeps Claude as the scarce reasoner (the **brain**) while delegating bulk mechanical work to external executor CLIs (the **body** — codex, opencode/gpt-5.5, opencode/deepseek).
 
+[![skills.sh](https://img.shields.io/badge/skills.sh-orchestrate-blue)](https://skills.sh/Observerstudio/orchestrate-skill)
+
+```bash
+npx skills add Observerstudio/orchestrate-skill
+```
+
 ---
 
 ## What it does
@@ -52,7 +58,13 @@ You need at least one of the two. Neither is hard-required — if nothing is con
 
 ## Installation
 
-Skills live under `~/.claude/skills/`. Clone this repo there:
+**Via the skills CLI (recommended):**
+
+```bash
+npx skills add Observerstudio/orchestrate-skill
+```
+
+**Via git clone:**
 
 ```bash
 # macOS / Linux
@@ -62,9 +74,7 @@ git clone https://github.com/Observerstudio/orchestrate-skill ~/.claude/skills/o
 git clone https://github.com/Observerstudio/orchestrate-skill "$env:USERPROFILE\.claude\skills\orchestrate"
 ```
 
-Or copy manually — only `SKILL.md` and `references/` are required at runtime; `evals/` is optional.
-
-That's it. Claude Code picks up skills from that directory automatically.
+Only `SKILL.md` and `references/` are required at runtime; `evals/` is optional. Claude Code picks up skills from `~/.claude/skills/` automatically.
 
 ---
 

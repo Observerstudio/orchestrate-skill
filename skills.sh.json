@@ -1,0 +1,10 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "groupings": [
+    {
+      "title": "Orchestration",
+      "description": "Brain & body orchestration — delegate bulk mechanical work to external executor CLIs (codex, opencode) while Claude stays the reasoner.",
+      "skills": ["orchestrate"]
+    }
+  ]
+}
