@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import secrets
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +10,7 @@ import yaml
 
 
 CURRENT_ORCHESTRATE_VERSION = "0.2"
+WORKTREE_PREFIX = "orchestrate-wt-"
 
 # Derived from references/task-classes.md + executor-capabilities.md — those docs are canonical.
 EXECUTOR_ALLOWED_TASK_CLASSES: dict[str, set[str]] = {
@@ -107,6 +110,141 @@ def _contains_uninstantiated_enum(value: Any) -> bool:
 
 def _normalize_text(value: Any) -> str:
     return str(value).strip()
+
+
+def _repo_path(value: str) -> Path:
+    return Path(value).resolve()
+
+
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+
+def _git_error(result: subprocess.CompletedProcess[str]) -> str:
+    return result.stderr.strip() or result.stdout.strip() or "git command failed"
+
+
+def _status_paths(output: str) -> list[str]:
+    paths: list[str] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        path_text = line[3:].strip() if len(line) >= 3 else line.strip()
+        if path_text:
+            paths.append(path_text)
+    return paths
+
+
+def _worktree_list_paths(output: str) -> list[Path]:
+    worktree_paths: list[Path] = []
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            worktree_paths.append(Path(line.removeprefix("worktree ")).resolve())
+    return worktree_paths
+
+
+def _is_generated_worktree(worktree_path: Path, repo_path: Path) -> bool:
+    return worktree_path != repo_path and worktree_path.name.startswith(WORKTREE_PREFIX)
+
+
+def _create_worktree(repo_path: Path, run_id: str) -> tuple[int, str]:
+    worktree_path = repo_path.parent / f"{WORKTREE_PREFIX}{run_id}-{secrets.token_hex(4)}"
+    result = _run_git(["git", "-C", str(repo_path), "worktree", "add", str(worktree_path), "HEAD"], cwd=repo_path)
+    if result.returncode != 0:
+        return 1, f"ERROR {result.stderr.strip()}"
+
+    return 0, f"WORKTREE {worktree_path.resolve()}"
+
+
+def _capture_worktree(repo_path: Path, worktree_path: Path, run_id: str) -> tuple[int, str]:
+    run_dir = repo_path / ".orchestrate" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    add_result = _run_git(["git", "-C", str(worktree_path), "add", "-N", "."], cwd=repo_path)
+    if add_result.returncode != 0:
+        return 1, f"ERROR {_git_error(add_result)}"
+
+    diff_result = _run_git(["git", "-C", str(worktree_path), "diff"], cwd=repo_path)
+    if diff_result.returncode != 0:
+        return 1, f"ERROR {_git_error(diff_result)}"
+
+    diff_patch_path = run_dir / "diff.patch"
+    diff_patch_path.write_text(diff_result.stdout, encoding="utf-8")
+
+    touched_result = _run_git(["git", "-C", str(worktree_path), "status", "--porcelain"], cwd=repo_path)
+    if touched_result.returncode != 0:
+        return 1, f"ERROR {_git_error(touched_result)}"
+
+    touched_files = _status_paths(touched_result.stdout)
+    touched_files_path = run_dir / "touched-files.txt"
+    touched_files_path.write_text("\n".join(touched_files) + ("\n" if touched_files else ""), encoding="utf-8")
+
+    live_result = _run_git(["git", "-C", str(repo_path), "status", "--porcelain"], cwd=repo_path)
+    if live_result.returncode != 0:
+        return 1, f"ERROR {_git_error(live_result)}"
+
+    live_paths = set(_status_paths(live_result.stdout))
+    breached_paths = [path for path in touched_files if path in live_paths]
+    if breached_paths:
+        return 3, "\n".join(f"ISOLATION-BREACH {path}" for path in breached_paths)
+
+    return 0, f"CAPTURED {len(touched_files)} files -> {diff_patch_path.resolve()}"
+
+
+def _remove_worktree(repo_path: Path, worktree_path: Path, force: bool) -> tuple[int, str]:
+    status_result = _run_git(["git", "-C", str(worktree_path), "status", "--porcelain"], cwd=repo_path)
+    if status_result.returncode != 0:
+        return 1, f"ERROR {_git_error(status_result)}"
+
+    if status_result.stdout.strip() and not force:
+        return 4, "ERROR worktree has uncaptured changes; run worktree-capture first or pass --force"
+
+    remove_args = ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree_path)]
+    remove_result = _run_git(remove_args, cwd=repo_path)
+    if remove_result.returncode != 0:
+        return 1, f"ERROR {_git_error(remove_result)}"
+
+    prune_result = _run_git(["git", "-C", str(repo_path), "worktree", "prune"], cwd=repo_path)
+    if prune_result.returncode != 0:
+        return 1, f"ERROR {_git_error(prune_result)}"
+
+    return 0, f"REMOVED {worktree_path}"
+
+
+def _prune_worktrees(repo_path: Path) -> tuple[int, str]:
+    list_result = _run_git(["git", "-C", str(repo_path), "worktree", "list", "--porcelain"], cwd=repo_path)
+    if list_result.returncode != 0:
+        return 1, f"ERROR {_git_error(list_result)}"
+
+    removed = 0
+    skipped = 0
+    for worktree_path in _worktree_list_paths(list_result.stdout):
+        if not _is_generated_worktree(worktree_path, repo_path):
+            continue
+
+        status_result = _run_git(["git", "-C", str(worktree_path), "status", "--porcelain"], cwd=repo_path)
+        if status_result.returncode != 0:
+            return 1, f"ERROR {_git_error(status_result)}"
+
+        if status_result.stdout.strip():
+            skipped += 1
+            print(f"SKIPPED {worktree_path} (uncaptured changes)")
+            continue
+
+        remove_result = _run_git(
+            ["git", "-C", str(repo_path), "worktree", "remove", "--force", str(worktree_path)],
+            cwd=repo_path,
+        )
+        if remove_result.returncode != 0:
+            return 1, f"ERROR {_git_error(remove_result)}"
+
+        removed += 1
+
+    prune_result = _run_git(["git", "-C", str(repo_path), "worktree", "prune"], cwd=repo_path)
+    if prune_result.returncode != 0:
+        return 1, f"ERROR {_git_error(prune_result)}"
+
+    return 0, f"PRUNED {removed} SKIPPED {skipped}"
 
 
 def _get_required_scalar_missing_fields(data: dict[str, Any]) -> list[str]:
@@ -361,6 +499,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate", help="validate a brief frontmatter block")
     validate_parser.add_argument("brief_path", help="path to a markdown brief")
+
+    worktree_create_parser = subparsers.add_parser("worktree-create", help="create a sibling git worktree")
+    worktree_create_parser.add_argument("--repo", default=".", help="path to the repository root")
+    worktree_create_parser.add_argument("--run-id", required=True, help="run identifier")
+
+    worktree_capture_parser = subparsers.add_parser("worktree-capture", help="capture a worktree diff")
+    worktree_capture_parser.add_argument("--repo", default=".", help="path to the repository root")
+    worktree_capture_parser.add_argument("--worktree", required=True, help="path to the worktree")
+    worktree_capture_parser.add_argument("--run-id", required=True, help="run identifier")
+
+    worktree_remove_parser = subparsers.add_parser("worktree-remove", help="remove a generated worktree")
+    worktree_remove_parser.add_argument("--repo", default=".", help="path to the repository root")
+    worktree_remove_parser.add_argument("--worktree", required=True, help="path to the worktree")
+    worktree_remove_parser.add_argument("--force", action="store_true", help="remove even if dirty")
+
+    worktree_prune_parser = subparsers.add_parser("worktree-prune", help="prune generated worktrees")
+    worktree_prune_parser.add_argument("--repo", default=".", help="path to the repository root")
     return parser
 
 
@@ -374,9 +529,22 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command != "validate":
-        print(f"ERROR: unsupported command: {args.command}")
-        print(parser.format_usage().strip())
-        return 1
+        repo_path = _repo_path(getattr(args, "repo", "."))
+        if args.command == "worktree-create":
+            exit_code, message = _create_worktree(repo_path, args.run_id)
+        elif args.command == "worktree-capture":
+            exit_code, message = _capture_worktree(repo_path, Path(args.worktree).resolve(), args.run_id)
+        elif args.command == "worktree-remove":
+            exit_code, message = _remove_worktree(repo_path, Path(args.worktree).resolve(), args.force)
+        elif args.command == "worktree-prune":
+            exit_code, message = _prune_worktrees(repo_path)
+        else:
+            print(f"ERROR: unsupported command: {args.command}")
+            print(parser.format_usage().strip())
+            return 1
+
+        print(message)
+        return exit_code
 
     try:
         data = _load_frontmatter(Path(args.brief_path))
