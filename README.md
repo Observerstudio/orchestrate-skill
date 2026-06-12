@@ -76,6 +76,20 @@ git clone https://github.com/Observerstudio/orchestrate-skill "$env:USERPROFILE\
 
 Only `SKILL.md` and `references/` are required at runtime; `evals/` is optional. Claude Code picks up skills from `~/.claude/skills/` automatically.
 
+### Updating
+
+```bash
+# skills CLI
+npx skills update            # or re-run: npx skills add Observerstudio/orchestrate-skill
+
+# git clone install
+git -C ~/.claude/skills/orchestrate pull
+# Windows (PowerShell)
+git -C "$env:USERPROFILE\.claude\skills\orchestrate" pull
+```
+
+Updates never touch your local state: `executors.local.md` (your executor config) is untracked and `.orchestrate/` (briefs, run logs, diffs) is gitignored, so both survive every update. The harness (`harness/orchestrate_run.py`, Python 3 + PyYAML) is optional — the skill works without it; new harness fields like `last_verified` degrade gracefully on configs that don't have them.
+
 ---
 
 ## Configuration — `executors.local.md`
