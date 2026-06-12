@@ -17,8 +17,9 @@ The body is also a tool you can decline. If a task is small, ambiguous, or load-
 
 ```
 discover executors → (gather spec with operator if fuzzy) → decide: delegate or self?
-   → write a self-contained brief → dispatch to the right executor (async)
-   → review against the brief's acceptance criteria → approve & integrate │ revise (≤2) │ pull it back
+   → classify the task → choose the executor → write a structured brief
+   → dispatch (async) → verify yourself → review against the brief's criteria
+   → approve & integrate │ revise (≤2) │ pull it back
 ```
 
 Everything below expands one of those steps. Read `references/executors.md` for the exact, environment-tested invocations and failure signatures before you dispatch anything — the transport has sharp edges (stdin hangs, 60s+ latencies, live-repo writes) that will waste cycles if you wing it.
@@ -62,11 +63,18 @@ Match the task to the executor's nature. The defining split is **agentic** (edit
 
 | Executor | Mode | Use it for |
 |----------|------|------------|
-| **codex** | agentic — edits files, **in an isolated git worktree** | primary code executor: bulk scaffolding, mechanical multi-file transforms, test generation. You review the worktree diff and cherry-pick what passes. |
-| **gpt-5.5** (opencode) | advisory — returns text | high-quality non-code bulk: docs, complex prose, large data transforms you then apply. Also your second-opinion reviewer when you want one. |
-| **deepseek** (opencode, free tier) | advisory — returns text | cheap, low-stakes, high-volume work where *free* matters more than speed. Keep it off the critical path — it's the slowest. |
+| **codex** | agentic — edits files, **in an isolated git worktree**, sandbox pinned to `workspace-write` | primary code executor: bulk scaffolding, mechanical multi-file transforms, test generation. You review the worktree diff and cherry-pick what passes. |
+| **codex read-only** (`--sandbox read-only`) | advisory — returns text/diff | review-diff and second-opinion work: fastest pipe to the model with zero write risk. Same model family as the implementer — it catches convention misses, not family-wide blind spots. |
+| **native fast subagent** (e.g. Haiku via the Agent tool) | advisory — returns findings | context gathering and cheap exploration: no cold load, but spends the brain's own budget. |
+| **opencode free tier** | advisory — returns text | usage-limit fallback: $0, slow (24–90s), non-sensitive content only. Keep it off the critical path. |
 
-Adapt the names/roles to whatever `executors.local.md` says. The principle is stable even when the toolbox changes: **agentic bodies for code that can be diffed and isolated; advisory bodies for text you'll integrate yourself; cheapest body for the lowest-stakes volume.**
+(Paid opencode models — e.g. gpt-5.5 — are **deferred** until funded; see `references/executor-capabilities.md` for the live status of every record.) Adapt the names/roles to whatever `executors.local.md` says. The principle is stable even when the toolbox changes: **agentic bodies for code that can be diffed and isolated; advisory bodies for text you'll integrate yourself; cheapest body for the lowest-stakes volume.**
+
+## v0.2 structured dispatch contract
+
+Before delegation, classify the task using `references/task-classes.md` — the canonical routing matrix; the most restrictive matching class wins. Then select an executor whose capability record in `references/executor-capabilities.md` allows that class. Then write the brief using `templates/brief-template.md`, whose YAML frontmatter (task class, risk, allowed paths, verification, revision cap) is the machine-readable half of the contract and whose run report schema is the output half.
+
+The classification is part of the review contract: if the body's output violates the declared task class, risk level, allowed paths, or executor constraints, **reject it before checking implementation quality**. Sensitive classes (domain, db, security, money, architecture) stay with the brain regardless of volume.
 
 **Safety, non-negotiable for agentic executors:** run them in an **isolated git worktree**, never the live working tree — and *actually point the executor's working directory at that worktree* (codex's sandbox roots at its cwd; if you don't cd into the worktree, it edits the live repo and the isolation is decorative — see the exact recipe in `references/executors.md`). codex defaults to `approval: never` + `workspace-write`, so it edits files unprompted.
 

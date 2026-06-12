@@ -157,13 +157,35 @@ It never loops retrying a rate-limited model. On a shared/new machine, it asks w
 
 ---
 
+## v0.2 structured workflow
+
+The skill now uses a structured dispatch contract:
+
+1. **Classify** the task against the canonical task-class matrix.
+2. **Pick an executor** whose capability record allows that class.
+3. **Write a frontmatter brief** — machine-readable contract in, machine-readable run report out.
+4. **Dispatch** in the correct mode (agentic → isolated worktree; advisory → diff/text the brain applies).
+5. **Verify deterministically** — the brain re-runs verification; the body's report is a claim, not evidence.
+6. **Review and integrate** only what passes; sensitive classes never leave the brain.
+
+See:
+- [`references/task-classes.md`](references/task-classes.md) — 13 task classes + routing rules (canonical)
+- [`references/executor-capabilities.md`](references/executor-capabilities.md) — capability records per executor
+- [`templates/brief-template.md`](templates/brief-template.md) — frontmatter brief + run report schema
+- [`docs/v0.2-roadmap.md`](docs/v0.2-roadmap.md) — where this is heading (v0.3 harness and beyond)
+
+---
+
 ## Reference files
 
 | File | Purpose |
 |------|---------|
 | [`SKILL.md`](SKILL.md) | The full skill — Claude reads this when orchestrate is invoked |
+| [`references/task-classes.md`](references/task-classes.md) | Canonical task-class routing matrix |
+| [`references/executor-capabilities.md`](references/executor-capabilities.md) | Executor capability records and routing rules |
 | [`references/executors.md`](references/executors.md) | Adapter field guide: exact headless invocations, latencies, failure signatures, worktree recipe |
 | [`references/brief-and-review.md`](references/brief-and-review.md) | Brief template + worked example + review checklist |
+| [`templates/brief-template.md`](templates/brief-template.md) | v0.2 frontmatter brief + run report contract |
 | [`evals/evals.json`](evals/evals.json) | 7 behavioral evals covering the key rules |
 
 ---

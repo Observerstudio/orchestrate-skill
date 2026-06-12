@@ -6,7 +6,20 @@ The brief is the contract you hand the body; the review is you holding it to tha
 
 The body re-loads the repo cold and shares none of your conversation. It does not know your conventions, your prior decisions, or what's out of scope. Left underspecified it will: invent its own patterns, refactor things you didn't ask about, drop the return-type contract, and confidently hand back something plausible and wrong. Every part of the template below exists to close one of those gaps.
 
+## Machine-readable frontmatter
+
+For v0.2+, every delegated task starts with YAML frontmatter so the brain, a future harness, and GitHub issues share the same contract — the canonical schema, field semantics, and worked examples live in `templates/brief-template.md`. Frontmatter is a **routing and enforcement layer, not a replacement for the human brief**: the prose sections below remain what the body actually works from.
+
+Frontmatter review rules (checked before dispatch):
+
+- `allowed_paths` must match the human Scope section exactly — a mismatch means the brief is internally inconsistent; fix it before sending.
+- `verification` commands must be concrete **and derived from the target repo** (lockfile → package manager, actual script names, or the repo's own task runner — see the derivation rule in `templates/brief-template.md`). An assumed or templated command is a dispatch blocker.
+- `risk` and `task_class` must be set (single literal values, per `references/task-classes.md`) before dispatch.
+- `requires_operator_approval` must be `true` for irreversible, DB, security, money, or product-behavior-sensitive changes.
+
 ## Brief template
+
+The prose skeleton below predates v0.2 and remains valid; for new work, prefer the full v0.2 template in `templates/brief-template.md` (this skeleton plus frontmatter and the run report).
 
 ````markdown
 # Brief: <one-line title>
@@ -74,6 +87,8 @@ That brief is tight enough that grading the result is mechanical: open each of t
 
 ## The review checklist (apply in order; stop at first hard fail)
 
+**Step zero — validate the run report against the frontmatter (before reading any code).** v0.2 runs return a machine-readable report (schema in `templates/brief-template.md`). Check: `touchedFiles` ⊆ `allowed_paths` — re-verified against the *actual diff*, not the report; every frontmatter `verification` command has a result — which you re-run yourself; `status`/`scopeCheck` treated as claims, never conclusions. A report that fails validation is rejected before implementation review begins. (Exit codes are not success signals — codex exits 0 on runs whose writes were all blocked; the touched-files check is the ground truth.)
+
 **Precondition — did the run complete?** Clean exit, summary present, every in-scope file actually touched. A partial/truncated run (the body died mid-transform, hit a usage limit at file 4 of 8) is a **discard**, not a revise — re-brief from a clean state. Never grade or integrate half a transform.
 
 1. **Scope** — did the diff touch *only* the files in Scope? Any extra file is an automatic revise. This catches the body's most common failure: helpful over-reach. (Note: "matches this diff shape" is a *scope* check — it never substitutes for correctness.)
@@ -84,6 +99,13 @@ That brief is tight enough that grading the result is mechanical: open each of t
 6. **Safety** — for anything touching auth, permissions, tenancy, money, data deletion, or the database/schema: scrutinize line by line, and pause for the operator. The body does not understand your threat model.
 
 **Pass** → integrate, tell the operator what landed. **Fail** → write *specific* revision feedback naming the exact violation and the fix, re-dispatch. **Second fail** → stop; finish it yourself or escalate. Two misses means the spec was the problem, and the brain fixes specs faster than the body re-guesses.
+
+## When the contract runs out
+
+Two situations end delegation for a chunk; in both, the answer is **never to loosen the constraints so the output passes**:
+
+- **`max_revisions` exhausted** (non-converging on the same criteria): the brain takes the chunk back and finishes it itself, or escalates to the operator with what was attempted and why it failed. The declared task class, allowed paths, and verification commands stand as written.
+- **`requires_operator_approval: true`**: the brain prepares the change and the review evidence, then stops and waits for the operator. Approval is a human verdict for these classes — the body cannot grant it, and neither can the brain on the body's behalf.
 
 ## Revision feedback that works
 
