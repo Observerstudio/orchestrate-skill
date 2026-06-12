@@ -1,3 +1,4 @@
 .orchestrate/
 __pycache__/
 *.pyc
+.obsidian/
