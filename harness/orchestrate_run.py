@@ -644,6 +644,54 @@ def _smoke_record(config_path: Path, executor_name: str, now: datetime) -> tuple
     return 1, f"ERROR executor not found: {executor_name}"
 
 
+def _dispatch_resolve_invoke_template(invoke: str) -> list[str] | str:
+    invoke_text = invoke.strip()
+    needs_shell = (
+        "|" in invoke_text
+        or "<" in invoke_text
+        or ">" in invoke_text
+        or invoke_text.lower().startswith("cmd /c")
+    )
+    if needs_shell:
+        return invoke_text
+    return shlex.split(invoke_text)
+
+
+def _dispatch_format_command(command: list[str] | str) -> str:
+    return command if isinstance(command, str) else shlex.join(command)
+
+
+def _dispatch_configured_invoke_command(
+    config_path: Path, preferred_executor: str
+) -> tuple[int, str | list[str]] | None:
+    data = _load_frontmatter(config_path)
+    executors = data.get("executors")
+    if not isinstance(executors, list):
+        raise ValueError("executors.local.md must contain an executors list")
+
+    for record in executors:
+        if not isinstance(record, dict) or "name" not in record:
+            raise ValueError("executors.local.md contains an invalid executor record")
+
+        if _normalize_text(record["name"]) != preferred_executor:
+            continue
+
+        status = _normalize_text(record.get("status")) if record.get("status") is not None else ""
+        if status == "deferred":
+            return 5, "DISPATCH-ABORTED executor-deferred"
+
+        invoke = record.get("invoke")
+        if _is_empty_scalar(invoke):
+            return 8, (
+                f"DISPATCH-ABORTED brain-executor: {preferred_executor} "
+                "is dispatched by the brain via the Agent tool, not the harness"
+            )
+
+        return 0, _dispatch_resolve_invoke_template(_normalize_text(invoke))
+
+    return None
+
+
 def _print_findings(findings: list[dict[str, str]]) -> int:
     blockers = 0
     for finding in findings:
@@ -678,6 +726,7 @@ def _dispatch(
     repo_path: Path,
     brief_path: Path,
     invoke_cmd: str | None,
+    config_path: Path | None,
     timeout_seconds: float,
     dry_run: bool,
 ) -> tuple[int, str]:
@@ -696,14 +745,27 @@ def _dispatch(
     preferred_executor = _normalize_text(data["preferred_executor"])
     if invoke_cmd is not None:
         try:
-            resolved_command = shlex.split(invoke_cmd)
+            resolved_command: list[str] | str = _dispatch_resolve_invoke_template(invoke_cmd)
         except ValueError as exc:
             return 1, f"ERROR: invalid invoke command: {exc}"
     else:
-        resolved_command = list(EXECUTOR_INVOKE_COMMANDS.get(preferred_executor, []))
-        if not resolved_command:
-            return 5, "DISPATCH-ABORTED no-invoke-command"
+        resolved_command = []
+        if config_path is not None:
+            try:
+                configured_resolution = _dispatch_configured_invoke_command(config_path, preferred_executor)
+            except (OSError, ValueError) as exc:
+                return 1, f"ERROR: {exc}"
 
+            if configured_resolution is not None:
+                configured_code, configured_result = configured_resolution
+                if configured_code != 0:
+                    return configured_code, configured_result
+                resolved_command = configured_result
+
+        if not resolved_command:
+            resolved_command = list(EXECUTOR_INVOKE_COMMANDS.get(preferred_executor, []))
+            if not resolved_command:
+                return 5, "DISPATCH-ABORTED no-invoke-command"
 
     task_id = _normalize_text(data["task_id"])
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d')}-{task_id}"
@@ -715,7 +777,7 @@ def _dispatch(
     if dry_run:
         return 0, "\n".join(
             [
-                f"DRY-RUN {shlex.join(resolved_command)}",
+                f"DRY-RUN {_dispatch_format_command(resolved_command)}",
                 f"WORKTREE {worktree_pattern}",
             ]
         )
@@ -724,10 +786,12 @@ def _dispatch(
     # finds through PATH+PATHEXT resolution; bare names raise WinError 2.
     # Resolved after --dry-run on purpose: dry-run must work on machines
     # without the executor installed.
-    resolved_executable = shutil.which(resolved_command[0])
-    if resolved_executable is None:
-        return 5, f"DISPATCH-ABORTED executor-not-found: {resolved_command[0]} is not on PATH"
-    resolved_command[0] = resolved_executable
+    shell_command = isinstance(resolved_command, str)
+    if not shell_command:
+        resolved_executable = shutil.which(resolved_command[0])
+        if resolved_executable is None:
+            return 5, f"DISPATCH-ABORTED executor-not-found: {resolved_command[0]} is not on PATH"
+        resolved_command[0] = resolved_executable
 
     output_lines = [f"VALIDATE {brief_path.resolve()}"]
 
@@ -739,7 +803,7 @@ def _dispatch(
     worktree_text = create_message.removeprefix("WORKTREE ").strip()
     worktree_path = Path(worktree_text).resolve()
     output_lines.append(f"CREATE-WORKTREE {worktree_path}")
-    output_lines.append(f"INVOKE {shlex.join(resolved_command)}")
+    output_lines.append(f"INVOKE {_dispatch_format_command(resolved_command)}")
 
     invoke_failed = False
     try:
@@ -753,6 +817,7 @@ def _dispatch(
                 stdout=logs_file,
                 stderr=subprocess.STDOUT,
                 timeout=timeout_seconds,
+                shell=shell_command,
             )
         invoke_returncode = invoke_result.returncode
         invoke_timed_out = False
@@ -1046,6 +1111,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--repo", default=".", help="path to the repository root")
     dispatch_parser.add_argument("--brief", required=True, help="path to a markdown brief")
     dispatch_parser.add_argument("--invoke-cmd", help="override executor command template")
+    dispatch_parser.add_argument("--config", help="path to executors.local.md")
     dispatch_parser.add_argument("--timeout", type=float, default=600, help="invoke timeout in seconds")
     dispatch_parser.add_argument("--dry-run", action="store_true", help="resolve without changing anything")
 
@@ -1089,6 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_path,
                 Path(args.brief).resolve(),
                 args.invoke_cmd,
+                Path(args.config).resolve() if getattr(args, "config", None) else None,
                 args.timeout,
                 args.dry_run,
             )
