@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import secrets
+import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -73,6 +74,13 @@ REQUIRED_SCALAR_FIELDS = [
     "requires_operator_approval",
     "data_sensitivity",
 ]
+
+# Canonical executor commands live in references/executors.md; keep the pinned
+# sandbox mapping here so dispatch stays deterministic in local runs.
+EXECUTOR_INVOKE_COMMANDS: dict[str, list[str]] = {
+    "codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write"],
+    "codex-readonly": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only"],
+}
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -640,6 +648,148 @@ def _print_findings(findings: list[dict[str, str]]) -> int:
     return 0
 
 
+def _format_timeout_seconds(timeout_seconds: float) -> str:
+    if float(timeout_seconds).is_integer():
+        return str(int(timeout_seconds))
+    return f"{timeout_seconds:g}"
+
+
+def _format_dispatch_validation(findings: list[dict[str, str]]) -> tuple[int, str]:
+    lines = [f"{finding['severity']} {finding['rule_id']}: {finding['message']}" for finding in findings]
+    blockers = sum(1 for finding in findings if finding["severity"] == "BLOCKER")
+    if blockers:
+        lines.append("DISPATCH-ABORTED validation")
+        return 2, "\n".join(lines)
+    return 0, "\n".join(lines)
+
+
+def _dispatch(
+    repo_path: Path,
+    brief_path: Path,
+    invoke_cmd: str | None,
+    timeout_seconds: float,
+    dry_run: bool,
+) -> tuple[int, str]:
+    try:
+        data = _load_frontmatter(brief_path)
+    except OSError as exc:
+        return 1, f"ERROR: {exc}"
+    except ValueError as exc:
+        return 2, f"BLOCKER missing-frontmatter: {exc}\nDISPATCH-ABORTED validation"
+
+    findings = validate_frontmatter(data)
+    validation_code, validation_message = _format_dispatch_validation(findings)
+    if validation_code != 0:
+        return validation_code, validation_message
+
+    preferred_executor = _normalize_text(data["preferred_executor"])
+    if invoke_cmd is not None:
+        try:
+            resolved_command = shlex.split(invoke_cmd)
+        except ValueError as exc:
+            return 1, f"ERROR: invalid invoke command: {exc}"
+    else:
+        resolved_command = list(EXECUTOR_INVOKE_COMMANDS.get(preferred_executor, []))
+        if not resolved_command:
+            return 5, "DISPATCH-ABORTED no-invoke-command"
+
+    task_id = _normalize_text(data["task_id"])
+    run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d')}-{task_id}"
+    run_dir = repo_path / ".orchestrate" / "runs" / run_id
+    logs_path = run_dir / "logs.txt"
+    diff_path = run_dir / "diff.patch"
+    worktree_pattern = repo_path.parent / f"{WORKTREE_PREFIX}{run_id}-*"
+
+    if dry_run:
+        return 0, "\n".join(
+            [
+                f"DRY-RUN {shlex.join(resolved_command)}",
+                f"WORKTREE {worktree_pattern}",
+            ]
+        )
+
+    output_lines = [f"VALIDATE {brief_path.resolve()}"]
+
+    create_code, create_message = _create_worktree(repo_path, run_id)
+    if create_code != 0:
+        output_lines.append(create_message)
+        return create_code, "\n".join(output_lines)
+
+    worktree_text = create_message.removeprefix("WORKTREE ").strip()
+    worktree_path = Path(worktree_text).resolve()
+    output_lines.append(f"CREATE-WORKTREE {worktree_path}")
+    output_lines.append(f"INVOKE {shlex.join(resolved_command)}")
+
+    invoke_failed = False
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        brief_bytes = brief_path.read_bytes()
+        with logs_path.open("wb") as logs_file:
+            invoke_result = subprocess.run(
+                resolved_command,
+                cwd=worktree_path,
+                input=brief_bytes,
+                stdout=logs_file,
+                stderr=subprocess.STDOUT,
+                timeout=timeout_seconds,
+            )
+        invoke_returncode = invoke_result.returncode
+        invoke_timed_out = False
+        if invoke_returncode != 0:
+            invoke_failed = True
+            output_lines.append(f"DISPATCH-INVOKE-FAILED {invoke_returncode}")
+    except subprocess.TimeoutExpired:
+        invoke_returncode = None
+        invoke_timed_out = True
+        output_lines.append(f"DISPATCH-TIMEOUT after {_format_timeout_seconds(timeout_seconds)}s")
+    except OSError as exc:
+        invoke_returncode = None
+        invoke_timed_out = False
+        invoke_failed = True
+        output_lines.append(f"DISPATCH-INVOKE-FAILED {exc}")
+    else:
+        invoke_timed_out = False
+
+    output_lines.append(f"CAPTURE {run_id}")
+    capture_code, capture_message = _capture_worktree(repo_path, worktree_path, run_id)
+    if capture_code == 3:
+        output_lines.append(capture_message)
+        return 3, "\n".join(output_lines)
+    if capture_code != 0:
+        output_lines.append(capture_message)
+        return 1, "\n".join(output_lines)
+
+    if invoke_timed_out:
+        output_lines.extend(
+            [
+                f"WORKTREE {worktree_path}",
+                f"LOGS {logs_path.resolve()}",
+                f"DIFF {diff_path.resolve()}",
+            ]
+        )
+        return 6, "\n".join(output_lines)
+
+    if invoke_failed:
+        output_lines.extend(
+            [
+                f"WORKTREE {worktree_path}",
+                f"LOGS {logs_path.resolve()}",
+                f"DIFF {diff_path.resolve()}",
+            ]
+        )
+        return 1, "\n".join(output_lines)
+
+    output_lines.extend(
+        [
+            f"DISPATCHED {run_id}",
+            f"WORKTREE {worktree_path}",
+            f"LOGS {logs_path.resolve()}",
+            f"DIFF {diff_path.resolve()}",
+        ]
+    )
+    return 0, "\n".join(output_lines)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="orchestrate_run.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -663,6 +813,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     worktree_prune_parser = subparsers.add_parser("worktree-prune", help="prune generated worktrees")
     worktree_prune_parser.add_argument("--repo", default=".", help="path to the repository root")
+
+    dispatch_parser = subparsers.add_parser(
+        "dispatch",
+        help="validate, create a worktree, invoke an executor, and capture the diff",
+    )
+    dispatch_parser.add_argument("--repo", default=".", help="path to the repository root")
+    dispatch_parser.add_argument("--brief", required=True, help="path to a markdown brief")
+    dispatch_parser.add_argument("--invoke-cmd", help="override executor command template")
+    dispatch_parser.add_argument("--timeout", type=float, default=600, help="invoke timeout in seconds")
+    dispatch_parser.add_argument("--dry-run", action="store_true", help="resolve without changing anything")
 
     smoke_status_parser = subparsers.add_parser("smoke-status", help="report executor smoke-test freshness")
     smoke_status_parser.add_argument("--config", required=True, help="path to executors.local.md")
@@ -694,6 +854,14 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, message = _remove_worktree(repo_path, Path(args.worktree).resolve(), args.force)
         elif args.command == "worktree-prune":
             exit_code, message = _prune_worktrees(repo_path)
+        elif args.command == "dispatch":
+            exit_code, message = _dispatch(
+                repo_path,
+                Path(args.brief).resolve(),
+                args.invoke_cmd,
+                args.timeout,
+                args.dry_run,
+            )
         else:
             if args.command == "smoke-status":
                 try:
