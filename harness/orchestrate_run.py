@@ -4,6 +4,7 @@ import argparse
 import fnmatch
 import json
 import secrets
+import re
 import shutil
 import shlex
 import subprocess
@@ -93,6 +94,12 @@ EXECUTOR_INVOKE_COMMANDS: dict[str, list[str]] = {
     "codex": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write"],
     "codex-readonly": ["codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only"],
 }
+
+# Canonical signature list lives in references/executors.md.
+AVAILABILITY_SIGNATURES = [
+    {"id": "codex-usage-limit", "pattern": r"hit your usage limit", "reset": r"try again at ([^.\n]+)"},
+    {"id": "opencode-balance", "pattern": r"Insufficient balance", "reset": None},
+]
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -807,6 +814,53 @@ def _dispatch_format_command(command: list[str] | str) -> str:
     return command if isinstance(command, str) else shlex.join(command)
 
 
+def _dispatch_write_availability(run_dir: Path, executor: str, signature_id: str, reset_hint: str) -> None:
+    availability_path = run_dir / "availability.json"
+    payload = {
+        "executor": executor,
+        "signature": signature_id,
+        "reset_hint": reset_hint,
+        "observed_at": _utc_isoformat_seconds(datetime.now(timezone.utc)),
+    }
+    try:
+        availability_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _dispatch_scan_availability(logs_path: Path, run_dir: Path, executor: str) -> tuple[str, str] | None:
+    try:
+        logs_text = logs_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    for signature in AVAILABILITY_SIGNATURES:
+        try:
+            if re.search(signature["pattern"], logs_text, re.IGNORECASE) is None:
+                continue
+        except re.error:
+            continue
+
+        reset_hint = "unknown"
+        reset_pattern = signature["reset"]
+        if reset_pattern is not None:
+            try:
+                reset_match = re.search(reset_pattern, logs_text, re.IGNORECASE)
+            except re.error:
+                reset_match = None
+            if reset_match is not None:
+                captured = reset_match.group(1) if reset_match.groups() else reset_match.group(0)
+                if captured is not None:
+                    captured_text = _normalize_text(captured)
+                    if captured_text:
+                        reset_hint = captured_text
+
+        _dispatch_write_availability(run_dir, executor, signature["id"], reset_hint)
+        return signature["id"], reset_hint
+
+    return None
+
+
 def _dispatch_configured_invoke_command(
     config_path: Path, preferred_executor: str
 ) -> tuple[int, str | list[str]] | None:
@@ -990,6 +1044,19 @@ def _dispatch(
     if capture_code != 0:
         output_lines.append(capture_message)
         return 1, "\n".join(output_lines)
+
+    availability = _dispatch_scan_availability(logs_path, run_dir, preferred_executor)
+    if availability is not None:
+        signature_id, reset_hint = availability
+        output_lines.append(f"DISPATCH-ABORTED usage-limit ({signature_id}, reset {reset_hint})")
+        output_lines.extend(
+            [
+                f"WORKTREE {worktree_path}",
+                f"LOGS {logs_path.resolve()}",
+                f"DIFF {diff_path.resolve()}",
+            ]
+        )
+        return 9, "\n".join(output_lines)
 
     if invoke_timed_out:
         output_lines.extend(
