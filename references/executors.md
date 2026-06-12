@@ -194,7 +194,7 @@ After integrating, **re-run `typecheck`/`lint`/`test` on the live tree yourself*
 | bootstraps ~3s then silent forever, no output at any log level (opencode) | stdin left open in a non-TTY shell | re-invoke with the `cmd /c "... < NUL ..."` form (see stdin rule) |
 | `Error: Insufficient balance` (opencode paid models) | OpenCode Zen workspace unfunded | don't retry; route to `*-free` models, codex, or solo; mark the executor `status: deferred` |
 | `Error: File not found: <your prompt text>` (opencode) | `-f` greedily ate the trailing positional message | put the message before `-f`, or pass it via `-f` |
-| `You've hit your usage limit` (codex) | quota exhausted | don't retry; ask operator / go solo; note reset time |
+| `You've hit your usage limit` (codex) | quota exhausted | don't retry; note reset time; **reroute the same brief to `claude-sonnet-native`** (Agent tool, model sonnet, worktree isolation — see executor-capabilities.md) or go solo |
 | `patch rejected: writing is blocked by read-only sandbox` (codex, exits 0) | untrusted dir defaulted to read-only sandbox | re-invoke with `--sandbox workspace-write`; never trust exit 0 — verify in-scope files were touched |
 | empty output past timeout (either) | model slow/throttled or stuck | kill, treat as down; ask operator / go solo |
 | non-empty but truncated/incomplete (agentic died mid-run) | partial edit (e.g. usage limit hit at file 4 of 8) | **discard, don't revise**; re-brief from clean HEAD |

@@ -121,6 +121,39 @@ standing_constraints:
 
 Primary cheap-exploration body: ~12× faster than the fastest external free model because there is no cold load. The trade is that it spends the same budget the brain runs on.
 
+### claude-sonnet-native
+
+```yaml
+name: claude-sonnet-native
+mode: agentic            # via the harness operator's Agent tool with worktree isolation — NOT a CLI the harness can invoke
+role: primary-code-fallback
+status: fallback         # condition: codex usage-limited or otherwise down
+can_edit: true
+can_run_commands: true
+isolation_required: worktree
+cost_tier: claude-usage
+expected_latency: low (native subagent, no cold load)
+reliability: high
+allowed_task_classes:
+  - mechanical-refactor
+  - scaffold
+  - test-generation
+  - bugfix-isolated
+  - docs-prose
+forbidden_task_classes:
+  - db-sensitive
+  - security-sensitive
+  - money-sensitive
+  - architecture-decision
+standing_constraints:
+  - dispatched by the brain via the Agent tool (model sonnet, worktree isolation), never by the harness CLI
+  - same brief, same Do-NOT constraints, same review gate as codex
+  - costs Claude usage — fallback only; codex returns to primary when its limit resets
+  - the reroute itself is a brain decision (falling back is a spend decision)
+```
+
+When codex reports a usage limit (see the signature table in `executors.md`), the brain re-dispatches the same brief to a native Sonnet subagent in an isolated worktree. Nothing else about the contract changes: frontmatter, scope, verification, and review apply identically. The harness's job is detection and reporting (`DISPATCH-ABORTED usage-limit` + reset hint); the reroute stays with the brain.
+
 ### opencode-free-tier
 
 ```yaml

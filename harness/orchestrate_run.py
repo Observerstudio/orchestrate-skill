@@ -31,6 +31,13 @@ EXECUTOR_ALLOWED_TASK_CLASSES: dict[str, set[str]] = {
         "second-opinion",
         "cheap-exploration",
     },
+    "claude-sonnet-native": {
+        "mechanical-refactor",
+        "scaffold",
+        "test-generation",
+        "bugfix-isolated",
+        "docs-prose",
+    },
     "claude-haiku-native": {
         "cheap-exploration",
         "docs-prose",
@@ -45,6 +52,7 @@ KNOWN_EXECUTORS = set(EXECUTOR_ALLOWED_TASK_CLASSES)
 EXECUTOR_MODES: dict[str, str] = {
     "codex": "agentic",
     "codex-readonly": "advisory",
+    "claude-sonnet-native": "agentic",  # via the Agent tool, not the harness CLI
     "claude-haiku-native": "advisory",
     "opencode-free-tier": "advisory",
 }

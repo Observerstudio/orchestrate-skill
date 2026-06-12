@@ -75,6 +75,26 @@ data_sensitivity: public
         self.assertIn("WARNING version-mismatch:", result.stdout)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "DISPATCHABLE")
 
+    def test_sonnet_native_is_valid_agentic_fallback_for_codex_classes(self) -> None:
+        findings = validate_frontmatter(
+            {
+                "orchestrate_version": "0.2",
+                "task_id": "sonnet-fallback",
+                "task_class": "bugfix-isolated",
+                "risk": "low",
+                "executor_mode": "agentic",
+                "preferred_executor": "claude-sonnet-native",
+                "allowed_paths": ["src/fix.ts"],
+                "forbidden_paths": [".env*"],
+                "verification": ["npm run typecheck"],
+                "max_revisions": 2,
+                "requires_operator_approval": False,
+                "data_sensitivity": "public",
+            }
+        )
+
+        self.assertFalse(any(finding["severity"] == "BLOCKER" for finding in findings), findings)
+
     def test_pipe_in_verification_command_is_not_an_enum_blocker(self) -> None:
         findings = validate_frontmatter(
             {
