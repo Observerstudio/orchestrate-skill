@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import json
 import secrets
 import shutil
 import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -801,6 +803,210 @@ def _dispatch(
     return 0, "\n".join(output_lines)
 
 
+def _normalize_repo_relative_path(value: Any) -> str:
+    text = _normalize_text(value).replace("\\", "/")
+    return PurePosixPath(text).as_posix()
+
+
+def _allowed_path_matches(path: str, allowed_entry: str) -> bool:
+    normalized_path = _normalize_repo_relative_path(path)
+    normalized_entry = _normalize_repo_relative_path(allowed_entry)
+
+    if any(char in normalized_entry for char in "*?["):
+        return fnmatch.fnmatchcase(normalized_path, normalized_entry)
+
+    if normalized_path == normalized_entry:
+        return True
+
+    prefix = normalized_entry.rstrip("/")
+    return bool(prefix) and normalized_path.startswith(f"{prefix}/")
+
+
+def _report_finding(rule_id: str, message: str) -> dict[str, str]:
+    return _finding("REPORT-FAIL", rule_id, message)
+
+
+def _report_check_schema_findings(report: dict[str, Any]) -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
+
+    required_keys = [
+        "runId",
+        "executor",
+        "status",
+        "scopeCheck",
+        "verification",
+        "touchedFiles",
+        "diffPath",
+        "logsPath",
+    ]
+    missing_keys = [key for key in required_keys if key not in report]
+    if missing_keys:
+        findings.append(_report_finding("report-schema", f"missing required keys: {', '.join(missing_keys)}"))
+
+    status = report.get("status")
+    if status not in {"completed", "failed", "partial"}:
+        findings.append(_report_finding("report-schema", f"status must be one of completed, failed, partial; got {status!r}"))
+
+    scope_check = report.get("scopeCheck")
+    if scope_check not in {"pass", "fail"}:
+        findings.append(_report_finding("report-schema", f"scopeCheck must be one of pass, fail; got {scope_check!r}"))
+
+    verification = report.get("verification")
+    if not isinstance(verification, list):
+        findings.append(_report_finding("report-schema", "verification must be a list of {cmd, status} objects"))
+    else:
+        for index, entry in enumerate(verification):
+            if not isinstance(entry, dict):
+                findings.append(_report_finding("report-schema", f"verification[{index}] must be an object"))
+                continue
+            if "cmd" not in entry or "status" not in entry:
+                findings.append(_report_finding("report-schema", f"verification[{index}] must contain cmd and status"))
+                continue
+            if entry["status"] not in {"pass", "fail"}:
+                findings.append(
+                    _report_finding(
+                        "report-schema",
+                        f"verification[{index}].status must be pass or fail; got {entry['status']!r}",
+                    )
+                )
+
+    touched_files = report.get("touchedFiles")
+    if not isinstance(touched_files, list):
+        findings.append(_report_finding("report-schema", "touchedFiles must be a list"))
+
+    for field in ("runId", "executor", "diffPath", "logsPath"):
+        if field not in report:
+            continue
+        if not isinstance(report[field], str):
+            findings.append(_report_finding("report-schema", f"{field} must be a string; got {type(report[field]).__name__}"))
+
+    return findings
+
+
+def _report_check(repo_path: Path, run_id: str, brief_path: Path) -> tuple[int, str]:
+    try:
+        brief = _load_frontmatter(brief_path)
+    except OSError as exc:
+        return 1, f"ERROR: {exc}"
+    except ValueError as exc:
+        return 1, f"ERROR: {exc}"
+
+    run_dir = repo_path / ".orchestrate" / "runs" / run_id
+    report_path = run_dir / "report.json"
+    touched_truth_path = run_dir / "touched-files.txt"
+
+    try:
+        report_text = report_path.read_text(encoding="utf-8")
+        report = json.loads(report_text)
+    except (OSError, json.JSONDecodeError):
+        return 7, "\n".join(
+            [
+                "REPORT-FAIL report-missing: report.json absent or unparseable JSON",
+                "REPORT-BLOCKED (1 failures)",
+                "NOTE: pass means claims are consistent — the brain still re-runs verification and reviews the diff.",
+            ]
+        )
+
+    if not isinstance(report, dict):
+        report = {}
+
+    failures: list[dict[str, str]] = []
+    failures.extend(_report_check_schema_findings(report))
+
+    report_run_id = report.get("runId")
+    if _normalize_text(report_run_id) != run_id:
+        failures.append(_report_finding("runid-mismatch", f"report.runId={report_run_id!r} does not match --run-id {run_id!r}"))
+
+    claimed_files_raw = report.get("touchedFiles") if isinstance(report.get("touchedFiles"), list) else []
+    claimed_files = {
+        _normalize_repo_relative_path(entry)
+        for entry in claimed_files_raw
+        if isinstance(entry, str)
+    }
+
+    if touched_truth_path.exists():
+        ground_truth = {
+            _normalize_repo_relative_path(line)
+            for line in touched_truth_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+    else:
+        ground_truth = set()
+
+    overclaimed = sorted(claimed_files - ground_truth)
+    underclaimed = sorted(ground_truth - claimed_files)
+    if overclaimed or underclaimed:
+        parts: list[str] = []
+        if overclaimed:
+            parts.append(f"overclaimed: {overclaimed}")
+        if underclaimed:
+            parts.append(f"underclaimed (dangerous): {underclaimed}")
+        failures.append(_report_finding("claim-vs-ground-truth", "; ".join(parts)))
+
+    allowed_paths = brief.get("allowed_paths")
+    allowed_entries = [entry for entry in allowed_paths if isinstance(entry, str)] if isinstance(allowed_paths, list) else []
+    scope_violations = sorted(
+        path for path in ground_truth if not any(_allowed_path_matches(path, allowed_entry) for allowed_entry in allowed_entries)
+    )
+    if scope_violations:
+        failures.append(
+            _report_finding(
+                "scope-violation",
+                f"ground truth outside allowed_paths: {scope_violations}",
+            )
+        )
+
+    brief_verification = (
+        [entry for entry in brief.get("verification", []) if isinstance(entry, str)]
+        if isinstance(brief.get("verification"), list)
+        else []
+    )
+    report_verification_cmds = {
+        _normalize_text(entry["cmd"])
+        for entry in report.get("verification", [])
+        if isinstance(entry, dict) and isinstance(entry.get("cmd"), str)
+    }
+    brief_verification_cmds = {entry for entry in brief_verification}
+    if brief_verification_cmds != report_verification_cmds:
+        failures.append(
+            _report_finding(
+                "verification-mismatch",
+                f"report cmds={sorted(report_verification_cmds)} != brief cmds={sorted(brief_verification_cmds)}",
+            )
+        )
+
+    report_status = _normalize_text(report.get("status")) if "status" in report else "<missing>"
+    report_scope_check = _normalize_text(report.get("scopeCheck")) if "scopeCheck" in report else "<missing>"
+    report_verification = report.get("verification") if isinstance(report.get("verification"), list) else []
+    failing_verification_entries = [
+        f"{_normalize_text(entry.get('cmd'))}:{_normalize_text(entry.get('status'))}"
+        for entry in report_verification
+        if isinstance(entry, dict) and _normalize_text(entry.get("status")) != "pass"
+    ]
+    if report_status != "completed" or report_scope_check != "pass" or failing_verification_entries:
+        detail_bits = []
+        if report_status != "completed":
+            detail_bits.append(f"status={report_status}")
+        if report_scope_check != "pass":
+            detail_bits.append(f"scopeCheck={report_scope_check}")
+        if failing_verification_entries:
+            detail_bits.append(f"verification failures={failing_verification_entries}")
+        failures.append(_report_finding("claimed-fail", f"body itself reports {', '.join(detail_bits)}"))
+
+    if failures:
+        lines = [f"{finding['severity']} {finding['rule_id']}: {finding['message']}" for finding in failures]
+        lines.append(f"REPORT-BLOCKED ({len(failures)} failures)")
+        lines.append("NOTE: pass means claims are consistent — the brain still re-runs verification and reviews the diff.")
+        return 2, "\n".join(lines)
+
+    return 0, "\n".join(
+        [
+            f"REPORT-OK {run_id}",
+            "NOTE: pass means claims are consistent — the brain still re-runs verification and reviews the diff.",
+        ]
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="orchestrate_run.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -834,6 +1040,11 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_parser.add_argument("--invoke-cmd", help="override executor command template")
     dispatch_parser.add_argument("--timeout", type=float, default=600, help="invoke timeout in seconds")
     dispatch_parser.add_argument("--dry-run", action="store_true", help="resolve without changing anything")
+
+    report_check_parser = subparsers.add_parser("report-check", help="compare a run report to captured reality")
+    report_check_parser.add_argument("--repo", default=".", help="path to the repository root")
+    report_check_parser.add_argument("--run-id", required=True, help="run identifier")
+    report_check_parser.add_argument("--brief", required=True, help="path to a markdown brief")
 
     smoke_status_parser = subparsers.add_parser("smoke-status", help="report executor smoke-test freshness")
     smoke_status_parser.add_argument("--config", required=True, help="path to executors.local.md")
@@ -873,6 +1084,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.timeout,
                 args.dry_run,
             )
+        elif args.command == "report-check":
+            exit_code, message = _report_check(repo_path, args.run_id, Path(args.brief).resolve())
         else:
             if args.command == "smoke-status":
                 try:
