@@ -60,6 +60,7 @@ standing_constraints:
   - no dependency installs
   - no migrations, db push, or seeds
   - no network calls
+  - no spawning other agents or executors (no recursive codex exec, no opencode) — every body reports to the brain, never to another body
   - sandbox pinned to workspace-write, cwd inside the isolated worktree
   - explicit allowed paths in every brief
 ```

@@ -41,6 +41,7 @@ Create / edit ONLY these files:
 the worktree does not sandbox them:>
 - Do not run migrations, `prisma db push`, seeds, or anything that writes to a database.
 - Do not `git push`, `git commit`, install packages, or make network calls.
+- Do not spawn other agents or executors (no recursive `codex exec`, no `opencode run`).
 - Edit files and run only read-only checks (`typecheck`, `lint`, tests that don't hit a live DB).
 
 ## Contract
