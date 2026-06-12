@@ -2,6 +2,19 @@
 
 How to actually drive each body model headlessly, what breaks, and how to add a new one. These invocations were verified on the operator's environment (Windows / PowerShell 7). Confirm, don't assume — a different machine may differ.
 
+For *which* executor may take *which* class of work, see `references/executor-capabilities.md` (capability records) and `references/task-classes.md` (the canonical routing matrix). This file covers transport only.
+
+## The stdin rule (read first — both adapters)
+
+Both codex and opencode **hang forever in a non-TTY shell when stdin is left open**, even when the prompt is passed as a positional argument. The run bootstraps (~3-4s), then goes silent at the model step with zero further output — at any log level. This looks like a model/network failure; it is not.
+
+- **codex:** pipe the brief in — `Get-Content brief.md -Raw | codex exec --skip-git-repo-check`. Piping closes stdin.
+- **opencode:** redirect stdin from the null device. PowerShell has no native `< NUL`, so wrap in `cmd /c`:
+  ```powershell
+  cmd /c "opencode run --pure --model opencode/<model> \"<PROMPT>\" < NUL > out.log 2>&1"
+  ```
+  Verified working form (returned PONG, exit 0). Always background the call with a timeout and read the out file.
+
 ## Config: `executors.local.md`
 
 Lives at `~/.claude/skills/orchestrate/executors.local.md`. Records this operator's toolbox so you don't re-probe or re-ask. Create it on first run (after discovery/asking), read it thereafter. Shape:
@@ -12,19 +25,38 @@ executors:
   - name: codex
     mode: agentic          # agentic = edits files | advisory = returns text
     role: primary-code
-    invoke: 'Get-Content brief.md -Raw | codex exec --skip-git-repo-check'  # run from inside the worktree
+    invoke: 'Get-Content brief.md -Raw | codex exec --skip-git-repo-check --sandbox workspace-write'  # run from inside the worktree
     isolate: worktree       # required for agentic — cd into the worktree first
-    notes: gpt-5.5 backend; ~4s start; approval:never, workspace-write
+    notes: gpt-5.5 backend; ~4s start; approval:never. Sandbox MUST be pinned — untrusted dirs default to read-only and the run fails with exit 0
+  - name: codex-readonly
+    mode: advisory
+    role: second-opinion        # same model as codex, write-disabled
+    invoke: 'Get-Content brief.md -Raw | codex exec --skip-git-repo-check --sandbox read-only'
+    notes: fastest pipe to gpt-5.5-class review; returns text only; must be a separate invocation from the implementing run
   - name: gpt-5.5
     mode: advisory
     role: high-quality-text
-    invoke: 'opencode run -m opencode/gpt-5.5 --print-logs "<PROMPT>"'
-    notes: 60s+ latency; cold-loads project each call
-  - name: deepseek
+    status: deferred            # paid OpenCode Zen model — fails with "Insufficient balance" until the workspace is funded
+    invoke: 'cmd /c "opencode run --pure --model opencode/gpt-5.5 \"<PROMPT>\" < NUL > out.log 2>&1"'
+    notes: 60s+ latency; cold-loads project each call; re-enable when funded
+  - name: opencode-gpt55-serve
     mode: advisory
-    role: cheap-volume
-    invoke: 'opencode run -m opencode/deepseek-v4-flash-free --print-logs "<PROMPT>"'
-    notes: free tier, slowest; off the critical path
+    role: high-quality-text-warm
+    status: deferred            # same billing gate as gpt-5.5; inherits its routing verbatim — only transport differs
+    invoke: 'opencode run --attach http://localhost:4096 --model opencode/gpt-5.5 --print-logs "<PROMPT>"'
+    requires:
+      - opencode-server-running
+    notes: warm OpenCode server; avoids repeated cold boot; still model-latency bound
+  - name: claude-haiku-native
+    mode: advisory
+    role: context-gathering     # not a CLI — the harness's own fast subagent tier
+    invoke: 'Agent tool — subagent_type: Explore, model: haiku'
+    notes: native Claude Code subagent, ~2s, no cold-load; costs Claude usage — swap to opencode-free when near the limit
+  - name: opencode-free
+    mode: advisory
+    role: usage-limit-fallback
+    invoke: 'cmd /c "opencode run --pure --model opencode/north-mini-code-free \"<PROMPT>\" < NUL > out.log 2>&1"'
+    notes: $0 models, 24-90s; non-sensitive data only; fallback when the primary budget runs low
 ---
 
 Free-text notes about this operator's preferences, limits, billing, etc.
@@ -35,13 +67,14 @@ When discovery finds nothing, ask the operator for each executor's `name`, `mode
 ## Known adapter: codex (agentic)
 
 - **Binary:** `codex` (codex-cli). On the operator's box: `C:\Program Files\nodejs\codex.ps1`.
-- **Invoke — feed the brief via STDIN from a file, never as a bare arg:**
+- **Invoke — feed the brief via STDIN from a file, never as a bare arg, and pin the sandbox:**
   ```powershell
-  Get-Content brief.md -Raw | codex exec --skip-git-repo-check
+  Get-Content brief.md -Raw | codex exec --skip-git-repo-check --sandbox workspace-write
   ```
   Two reasons. (1) Bare-arg form (`codex exec "prompt"`) **hangs** in a non-TTY shell: it prints `Reading additional input from stdin...` and blocks forever waiting on stdin that never closes — piping is what makes it headless. (2) Real briefs are multi-line markdown with backticks, `$`, quotes, and `[ ]`; inlining one as a double-quoted PowerShell arg interpolates `$…` and breaks on embedded quotes. Always write the brief to a file and pipe it in.
 - **Latency:** ~4s to start producing output when healthy.
-- **Sandbox reality:** defaults to `approval: never` + `sandbox: workspace-write` scoped to its **current working directory**. It *will* edit files with no confirmation, and the sandbox stops at file edits — it does **not** isolate the database (the worktree inherits the same `.env`/`DATABASE_URL`), the network, package installs, or the git remote. → **Always run it inside an isolated worktree (cd into it — see recipe)** *and* put hard Do-NOT constraints in the brief: no migrations/`db push`/seeds/DB writes, no `git push`/`commit`, no installs, no network. If codex exposes a tighter sandbox (`-c sandbox_permissions=...` / read-only modes), prefer it for review-style runs.
+- **Pin the sandbox explicitly — the default is per-directory trust, not a stable global.** In an untrusted directory (e.g. a freshly created worktree), codex silently falls back to a **read-only sandbox**: it burns the full token cost producing content, fails every write with `patch rejected: writing is blocked by read-only sandbox`, and still **exits 0**. Always pass the mode you mean: `--sandbox workspace-write` for agentic runs, `--sandbox read-only` for advisory/review runs (this is the natural "codex as reviewer" invocation — same model, zero write risk). Never trust codex's exit code as a success signal; check that the brief's in-scope files were actually touched.
+- **Sandbox reality:** when writable, runs `approval: never` + `sandbox: workspace-write` scoped to its **current working directory**. It *will* edit files with no confirmation, and the sandbox stops at file edits — it does **not** isolate the database (the worktree inherits the same `.env`/`DATABASE_URL`), the network, package installs, or the git remote. → **Always run it inside an isolated worktree (cd into it — see recipe)** *and* put hard Do-NOT constraints in the brief: no migrations/`db push`/seeds/DB writes, no `git push`/`commit`, no installs, no network. If codex exposes a tighter sandbox (`-c sandbox_permissions=...` / read-only modes), prefer it for review-style runs.
 - **Timeout it.** A wedged codex run should be killed and treated as down, same as opencode — don't let an agentic call hang the session.
 - **Backend:** runs `gpt-5.5` via `openai` provider by default.
 - **Usage-limit signature (treat as "down"):**
@@ -64,6 +97,32 @@ When discovery finds nothing, ask the operator for each executor's `name`, `mode
 - **Latency:** **high — 60s+.** Each call cold-bootstraps: creates an instance, loads the project at the cwd, loads plugins, inits providers (~4s), *then* calls the model (the bulk of the wait), and may run a snapshot prune. Free DeepSeek is the slowest.
 - **Critical gotcha — never pipe through `Select-Object`/`Select-String`:** `opencode run ... | Select-Object -Last N` makes PowerShell buffer the entire stream and *looks* like an indefinite hang. Redirect to a file or let it stream raw instead.
 - **Advisory only:** it returns text to stdout; it does not edit your repo. You apply whatever it returns.
+- **Use `--pure` for headless runs:** skips external plugins (and their network calls) — faster, fewer moving parts.
+- **Model availability is a billing fact, not a config fact.** Paid gateway models (e.g. `opencode/gpt-5.5`, `opencode/claude-haiku-4-5`) fail with `Error: Insufficient balance` unless the OpenCode Zen workspace is funded — only the `*-free` models run on an unfunded workspace. Until funded: GPT-5.5-class advisory work routes through codex (read-only invocation or throwaway worktree, diff only), and fast cheap exploration routes through the harness's native subagents if available. Verify with the PONG probe before relying on any paid model.
+- **Measured free-tier latencies** (single-run, cold-load dominated, ±a few s): `north-mini-code-free` ~24s, `deepseek-v4-flash-free` ~27s, `mimo-v2.5-free` ~32s, `nemotron-3-ultra-free` ~90s (avoid). Free models are the usage-limit fallback, not the default tier.
+
+## Known adapter: opencode serve / warm advisory mode
+
+Optional optimization for **repeated free-tier calls** when the per-call cold boot (instance + project + plugins + providers) is hurting iteration speed. This is not the primary advisory path — see the routing note above.
+
+Start the server once:
+
+```powershell
+opencode serve --port 4096 --hostname 127.0.0.1
+```
+
+Then each call attaches instead of cold-booting:
+
+```powershell
+opencode run --attach http://localhost:4096 --model opencode/<model> --print-logs "<PROMPT>"
+```
+
+Notes:
+
+- This avoids repeated MCP/plugin cold boot. **It does not remove model latency** — free-tier inference is the dominant cost (24-90s) regardless.
+- Smoke-test the attached path with the PONG probe before relying on it.
+- Bind to localhost (as above) by default. Do not expose the server publicly without explicit auth configuration.
+- The stdin rule still applies to the `run` client side.
 
 ## Async dispatch pattern
 
@@ -116,8 +175,11 @@ After integrating, **re-run `typecheck`/`lint`/`test` on the live tree yourself*
 | Signature | Meaning | Action |
 |-----------|---------|--------|
 | `Reading additional input from stdin...` (codex, hangs) | prompt passed as arg, not stdin | re-invoke with `Get-Content brief.md -Raw \| codex exec` |
+| bootstraps ~3s then silent forever, no output at any log level (opencode) | stdin left open in a non-TTY shell | re-invoke with the `cmd /c "... < NUL ..."` form (see stdin rule) |
+| `Error: Insufficient balance` (opencode paid models) | OpenCode Zen workspace unfunded | don't retry; route to `*-free` models, codex, or solo; mark the executor `status: deferred` |
 | `Error: File not found: <your prompt text>` (opencode) | `-f` greedily ate the trailing positional message | put the message before `-f`, or pass it via `-f` |
 | `You've hit your usage limit` (codex) | quota exhausted | don't retry; ask operator / go solo; note reset time |
+| `patch rejected: writing is blocked by read-only sandbox` (codex, exits 0) | untrusted dir defaulted to read-only sandbox | re-invoke with `--sandbox workspace-write`; never trust exit 0 — verify in-scope files were touched |
 | empty output past timeout (either) | model slow/throttled or stuck | kill, treat as down; ask operator / go solo |
 | non-empty but truncated/incomplete (agentic died mid-run) | partial edit (e.g. usage limit hit at file 4 of 8) | **discard, don't revise**; re-brief from clean HEAD |
 | apparent infinite hang with `Select-Object` in pipe | PowerShell buffering, not a real hang | redirect to file instead of piping |
