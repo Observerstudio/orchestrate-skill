@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import secrets
+import shutil
 import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -693,6 +694,7 @@ def _dispatch(
         if not resolved_command:
             return 5, "DISPATCH-ABORTED no-invoke-command"
 
+
     task_id = _normalize_text(data["task_id"])
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d')}-{task_id}"
     run_dir = repo_path / ".orchestrate" / "runs" / run_id
@@ -707,6 +709,15 @@ def _dispatch(
                 f"WORKTREE {worktree_pattern}",
             ]
         )
+
+    # On Windows, executor CLIs are often .cmd/.bat shims that CreateProcess only
+    # finds through PATH+PATHEXT resolution; bare names raise WinError 2.
+    # Resolved after --dry-run on purpose: dry-run must work on machines
+    # without the executor installed.
+    resolved_executable = shutil.which(resolved_command[0])
+    if resolved_executable is None:
+        return 5, f"DISPATCH-ABORTED executor-not-found: {resolved_command[0]} is not on PATH"
+    resolved_command[0] = resolved_executable
 
     output_lines = [f"VALIDATE {brief_path.resolve()}"]
 
