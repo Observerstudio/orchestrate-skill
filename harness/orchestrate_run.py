@@ -7,6 +7,7 @@ import secrets
 import shutil
 import shlex
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -644,6 +645,151 @@ def _smoke_record(config_path: Path, executor_name: str, now: datetime) -> tuple
     return 1, f"ERROR executor not found: {executor_name}"
 
 
+def _smoke_executor_state(record: dict[str, Any], now: datetime) -> tuple[str, str | None]:
+    status = _normalize_text(record.get("status")) if record.get("status") is not None else ""
+    if status == "deferred":
+        return "deferred", None
+
+    last_verified = record.get("last_verified")
+    if last_verified is None or _is_empty_scalar(last_verified):
+        return "unverified", None
+
+    verified_at = _parse_iso_datetime(last_verified)
+    age = now - verified_at
+    age_text = _format_age(age)
+    if age <= timedelta(hours=24):
+        return "fresh", age_text
+    return "stale", age_text
+
+
+def _smoke_probe_resolve_command(invoke: Any) -> tuple[bool, list[str] | str]:
+    resolved_command = _dispatch_resolve_invoke_template(_normalize_text(invoke))
+    if isinstance(resolved_command, str):
+        return True, resolved_command
+
+    resolved_executable = shutil.which(resolved_command[0])
+    if resolved_executable is None:
+        raise FileNotFoundError(f"{resolved_command[0]} is not on PATH")
+
+    resolved_command[0] = resolved_executable
+    return False, resolved_command
+
+
+def _smoke_probe_candidate(
+    config_path: Path,
+    record: dict[str, Any],
+    timeout_seconds: float,
+) -> str:
+    name = _normalize_text(record["name"])
+    invoke = record.get("invoke")
+    if _is_empty_scalar(invoke):
+        return f"SKIPPED {name} (brain-executor)"
+
+    try:
+        shell_command, resolved_command = _smoke_probe_resolve_command(invoke)
+    except ValueError as exc:
+        raise ValueError(f"invalid invoke command for {name}: {exc}") from exc
+    except FileNotFoundError as exc:
+        return f"PROBE-FAIL {name}: spawn-failure: {exc}"
+
+    start = time.monotonic()
+    try:
+        result = subprocess.run(
+            resolved_command,
+            cwd=config_path.parent,
+            input="reply with exactly: PONG",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_seconds,
+            shell=shell_command,
+        )
+    except subprocess.TimeoutExpired:
+        return f"PROBE-FAIL {name}: timeout after {_format_timeout_seconds(timeout_seconds)}s"
+    except OSError as exc:
+        return f"PROBE-FAIL {name}: spawn-failure: {exc}"
+
+    elapsed = _format_timeout_seconds(time.monotonic() - start)
+    output = result.stdout or ""
+    if result.returncode == 0 and "PONG" in output:
+        record_result = _smoke_record(config_path, name, datetime.now(timezone.utc))
+        if record_result[0] != 0:
+            raise ValueError(record_result[1])
+        return f"PROBE-OK {name} ({elapsed}s)"
+
+    if result.returncode != 0:
+        return f"PROBE-FAIL {name}: exit {result.returncode}"
+    return f"PROBE-FAIL {name}: missing PONG"
+
+
+def _smoke_probe(config_path: Path, now: datetime, executor_name: str | None, timeout_seconds: float) -> tuple[int, str]:
+    data = _load_frontmatter(config_path)
+    executors = data.get("executors")
+    if not isinstance(executors, list):
+        raise ValueError("executors.local.md must contain an executors list")
+
+    lines: list[str] = []
+    probed = 0
+    ok = 0
+    fail = 0
+
+    if executor_name is not None:
+        target_record: dict[str, Any] | None = None
+        for record in executors:
+            if not isinstance(record, dict) or "name" not in record:
+                raise ValueError("executors.local.md contains an invalid executor record")
+            if _normalize_text(record["name"]) == executor_name:
+                target_record = record
+                break
+
+        if target_record is None:
+            raise ValueError(f"executor not found: {executor_name}")
+
+        status, _ = _smoke_executor_state(target_record, now)
+        name = _normalize_text(target_record["name"])
+        if status == "deferred":
+            lines.append(f"DEFERRED {name}")
+        elif _is_empty_scalar(target_record.get("invoke")):
+            lines.append(f"SKIPPED {name} (brain-executor)")
+        else:
+            probed += 1
+            probe_line = _smoke_probe_candidate(config_path, target_record, timeout_seconds)
+            lines.append(probe_line)
+            if probe_line.startswith("PROBE-OK "):
+                ok += 1
+            elif probe_line.startswith("PROBE-FAIL "):
+                fail += 1
+        lines.append(f"PROBED {probed} OK {ok} FAIL {fail}")
+        return (2 if fail else 0), "\n".join(lines)
+
+    for record in executors:
+        if not isinstance(record, dict) or "name" not in record:
+            raise ValueError("executors.local.md contains an invalid executor record")
+
+        name = _normalize_text(record["name"])
+        status, age_text = _smoke_executor_state(record, now)
+        if status == "deferred":
+            lines.append(f"DEFERRED {name}")
+            continue
+        if _is_empty_scalar(record.get("invoke")):
+            lines.append(f"SKIPPED {name} (brain-executor)")
+            continue
+        if status == "fresh":
+            lines.append(f"FRESH {name} (verified {age_text} ago)")
+            continue
+
+        probed += 1
+        probe_line = _smoke_probe_candidate(config_path, record, timeout_seconds)
+        lines.append(probe_line)
+        if probe_line.startswith("PROBE-OK "):
+            ok += 1
+        elif probe_line.startswith("PROBE-FAIL "):
+            fail += 1
+
+    lines.append(f"PROBED {probed} OK {ok} FAIL {fail}")
+    return (2 if fail else 0), "\n".join(lines)
+
+
 def _dispatch_resolve_invoke_template(invoke: str) -> list[str] | str:
     invoke_text = invoke.strip()
     needs_shell = (
@@ -1128,6 +1274,15 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke_record_parser.add_argument("--config", required=True, help="path to executors.local.md")
     smoke_record_parser.add_argument("--executor", required=True, help="executor name to mark verified")
     smoke_record_parser.add_argument("--now", help=argparse.SUPPRESS)
+
+    smoke_probe_parser = subparsers.add_parser(
+        "smoke-probe",
+        help="probe stale or unverified executor smoke checks",
+    )
+    smoke_probe_parser.add_argument("--config", required=True, help="path to executors.local.md")
+    smoke_probe_parser.add_argument("--executor", help="executor name to probe")
+    smoke_probe_parser.add_argument("--timeout", type=float, default=120, help="probe timeout in seconds")
+    smoke_probe_parser.add_argument("--now", help=argparse.SUPPRESS)
     return parser
 
 
@@ -1173,6 +1328,13 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     now = _parse_iso_datetime(args.now) if args.now else datetime.now(timezone.utc)
                     exit_code, message = _smoke_record(Path(args.config), args.executor, now)
+                except (OSError, ValueError) as exc:
+                    print(f"ERROR: {exc}")
+                    return 1
+            elif args.command == "smoke-probe":
+                try:
+                    now = _parse_iso_datetime(args.now) if args.now else datetime.now(timezone.utc)
+                    exit_code, message = _smoke_probe(Path(args.config), now, args.executor, args.timeout)
                 except (OSError, ValueError) as exc:
                     print(f"ERROR: {exc}")
                     return 1
