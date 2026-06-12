@@ -62,6 +62,22 @@ executors:
 Free-text notes about this operator's preferences, limits, billing, etc.
 ```
 
+### `last_verified`
+
+Add `last_verified` to an executor record when you want the harness to skip a fresh smoke probe for 24 hours. Use an ISO-8601 UTC timestamp such as `2026-06-12T15:53:00Z`.
+
+- Present and within 24h: `smoke-status` reports `FRESH`
+- Present and older than 24h: `smoke-status` reports `STALE`
+- Absent: `smoke-status` reports `UNVERIFIED`, which keeps the old behavior of probing every session
+
+Example:
+
+```markdown
+  - name: codex
+    mode: agentic
+    last_verified: 2026-06-12T15:53:00Z
+```
+
 When discovery finds nothing, ask the operator for each executor's `name`, `mode`, and exact headless `invoke` string, then write this file.
 
 ## Known adapter: codex (agentic)

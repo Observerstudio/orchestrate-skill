@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import secrets
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -110,6 +111,41 @@ def _contains_uninstantiated_enum(value: Any) -> bool:
 
 def _normalize_text(value: Any) -> str:
     return str(value).strip()
+
+
+def _utc_isoformat_seconds(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_iso_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    if not isinstance(value, str):
+        raise ValueError(f"invalid ISO-8601 timestamp: {value!r}")
+
+    normalized = value.strip().replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_age(delta: timedelta) -> str:
+    total_seconds = max(0, int(delta.total_seconds()))
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+
+    if days:
+        return f"{days}d" if hours == 0 else f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
 
 
 def _repo_path(value: str) -> Path:
@@ -461,12 +497,34 @@ def _extract_frontmatter_block(text: str) -> str | None:
     return "\n".join(lines[1:end_index])
 
 
+def _split_frontmatter_document(text: str) -> tuple[str, str, str, str] | None:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return None
+
+    end_index: int | None = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            end_index = index
+            break
+
+    if end_index is None:
+        return None
+
+    opener = lines[0]
+    frontmatter = "".join(lines[1:end_index])
+    closer = lines[end_index]
+    body = "".join(lines[end_index + 1 :])
+    return opener, frontmatter, closer, body
+
+
 def _load_frontmatter(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
-    frontmatter_block = _extract_frontmatter_block(text)
-    if frontmatter_block is None:
+    document = _split_frontmatter_document(text)
+    if document is None:
         raise ValueError("missing or unparseable YAML frontmatter")
 
+    _, frontmatter_block, _, _ = document
     try:
         parsed = yaml.safe_load(frontmatter_block)
     except yaml.YAMLError as exc:  # pragma: no cover - parser errors are exercised through CLI tests
@@ -476,6 +534,95 @@ def _load_frontmatter(path: Path) -> dict[str, Any]:
         raise ValueError("missing or unparseable YAML frontmatter")
 
     return parsed
+
+
+def _load_frontmatter_document(path: Path) -> tuple[dict[str, Any], tuple[str, str, str, str]]:
+    text = path.read_text(encoding="utf-8")
+    document = _split_frontmatter_document(text)
+    if document is None:
+        raise ValueError("missing or unparseable YAML frontmatter")
+
+    _, frontmatter_block, _, _ = document
+    try:
+        parsed = yaml.safe_load(frontmatter_block)
+    except yaml.YAMLError as exc:  # pragma: no cover - parser errors are exercised through CLI tests
+        raise ValueError("missing or unparseable YAML frontmatter") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("missing or unparseable YAML frontmatter")
+
+    return parsed, document
+
+
+def _dump_frontmatter_document(data: dict[str, Any], document: tuple[str, str, str, str]) -> str:
+    opener, _, closer, body = document
+    newline = "\r\n" if opener.endswith("\r\n") else "\n"
+    dumped = yaml.safe_dump(data, sort_keys=False, default_flow_style=False, width=4096)
+    if not dumped.endswith("\n"):
+        dumped += "\n"
+    dumped = dumped.replace("\n", newline)
+    return f"{opener}{dumped}{closer}{body}"
+
+
+def _smoke_executor_records(data: dict[str, Any], now: datetime) -> tuple[list[str], int]:
+    executors = data.get("executors")
+    if not isinstance(executors, list):
+        raise ValueError("executors.local.md must contain an executors list")
+
+    lines: list[str] = []
+    probe_needed = 0
+    for record in executors:
+        if not isinstance(record, dict) or "name" not in record:
+            raise ValueError("executors.local.md contains an invalid executor record")
+
+        name = _normalize_text(record["name"])
+        status = _normalize_text(record.get("status")) if record.get("status") is not None else ""
+        if status == "deferred":
+            lines.append(f"DEFERRED {name}")
+            continue
+
+        last_verified = record.get("last_verified")
+        if last_verified is None or _is_empty_scalar(last_verified):
+            lines.append(f"UNVERIFIED {name}")
+            probe_needed += 1
+            continue
+
+        verified_at = _parse_iso_datetime(last_verified)
+        age = now - verified_at
+        age_text = _format_age(age)
+        if age <= timedelta(hours=24):
+            lines.append(f"FRESH {name} (verified {age_text} ago)")
+        else:
+            lines.append(f"STALE {name} (verified {age_text} ago)")
+            probe_needed += 1
+
+    lines.append(f"PROBE-NEEDED {probe_needed}")
+    return lines, probe_needed
+
+
+def _smoke_status(config_path: Path, now: datetime) -> tuple[int, str]:
+    data = _load_frontmatter(config_path)
+    lines, _ = _smoke_executor_records(data, now)
+    return 0, "\n".join(lines)
+
+
+def _smoke_record(config_path: Path, executor_name: str, now: datetime) -> tuple[int, str]:
+    data, document = _load_frontmatter_document(config_path)
+    executors = data.get("executors")
+    if not isinstance(executors, list):
+        return 1, "ERROR executors.local.md must contain an executors list"
+
+    timestamp = _utc_isoformat_seconds(now)
+    for record in executors:
+        if not isinstance(record, dict):
+            continue
+        if _normalize_text(record.get("name")) != executor_name:
+            continue
+        record["last_verified"] = timestamp
+        config_path.write_text(_dump_frontmatter_document(data, document), encoding="utf-8")
+        return 0, f"RECORDED {executor_name} {timestamp}"
+
+    return 1, f"ERROR executor not found: {executor_name}"
 
 
 def _print_findings(findings: list[dict[str, str]]) -> int:
@@ -516,6 +663,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     worktree_prune_parser = subparsers.add_parser("worktree-prune", help="prune generated worktrees")
     worktree_prune_parser.add_argument("--repo", default=".", help="path to the repository root")
+
+    smoke_status_parser = subparsers.add_parser("smoke-status", help="report executor smoke-test freshness")
+    smoke_status_parser.add_argument("--config", required=True, help="path to executors.local.md")
+    smoke_status_parser.add_argument("--now", help=argparse.SUPPRESS)
+
+    smoke_record_parser = subparsers.add_parser("smoke-record", help="mark an executor as freshly smoke-tested")
+    smoke_record_parser.add_argument("--config", required=True, help="path to executors.local.md")
+    smoke_record_parser.add_argument("--executor", required=True, help="executor name to mark verified")
+    smoke_record_parser.add_argument("--now", help=argparse.SUPPRESS)
     return parser
 
 
@@ -539,9 +695,24 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "worktree-prune":
             exit_code, message = _prune_worktrees(repo_path)
         else:
-            print(f"ERROR: unsupported command: {args.command}")
-            print(parser.format_usage().strip())
-            return 1
+            if args.command == "smoke-status":
+                try:
+                    now = _parse_iso_datetime(args.now) if args.now else datetime.now(timezone.utc)
+                    exit_code, message = _smoke_status(Path(args.config), now)
+                except (OSError, ValueError) as exc:
+                    print(f"ERROR: {exc}")
+                    return 1
+            elif args.command == "smoke-record":
+                try:
+                    now = _parse_iso_datetime(args.now) if args.now else datetime.now(timezone.utc)
+                    exit_code, message = _smoke_record(Path(args.config), args.executor, now)
+                except (OSError, ValueError) as exc:
+                    print(f"ERROR: {exc}")
+                    return 1
+            else:
+                print(f"ERROR: unsupported command: {args.command}")
+                print(parser.format_usage().strip())
+                return 1
 
         print(message)
         return exit_code
