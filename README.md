@@ -90,6 +90,25 @@ git -C "$env:USERPROFILE\.claude\skills\orchestrate" pull
 
 Updates never touch your local state: `executors.local.md` (your executor config) is untracked and `.orchestrate/` (briefs, run logs, diffs) is gitignored, so both survive every update. The harness (`harness/orchestrate_run.py`, Python 3 + PyYAML) is optional — the skill works without it; new harness fields like `last_verified` degrade gracefully on configs that don't have them.
 
+### The `orc` alias
+
+`harness/` ships thin wrappers so you don't type the full python invocation — `orc validate brief.md` instead of `python harness/orchestrate_run.py validate brief.md`:
+
+- `orc.cmd` / `orc.ps1` (Windows), `orc` (sh) — all resolve `orchestrate_run.py` relative to themselves.
+- Either add the `harness/` directory to PATH, or define a profile function pointing at your install:
+
+```powershell
+# PowerShell ($PROFILE)
+function orc { python "$env:USERPROFILE\.claude\skills\orchestrate\harness\orchestrate_run.py" @args }
+```
+
+```bash
+# bash/zsh (~/.bashrc / ~/.zshrc)
+alias orc='python3 ~/.claude/skills/orchestrate/harness/orchestrate_run.py'
+```
+
+(`orc`, not `oc` — `oc` is already taken by the OpenShift CLI.)
+
 ---
 
 ## Configuration — `executors.local.md`

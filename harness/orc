@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# Thin alias for the orchestrate harness: orc validate brief.md, orc dispatch ..., etc.
+exec python3 "$(dirname "$0")/orchestrate_run.py" "$@"
