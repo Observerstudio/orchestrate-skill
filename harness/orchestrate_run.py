@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fnmatch
 import json
+import os
 import secrets
 import re
+import signal
 import shutil
 import shlex
 import subprocess
@@ -96,9 +99,15 @@ EXECUTOR_INVOKE_COMMANDS: dict[str, list[str]] = {
 }
 
 # Canonical signature list lives in references/executors.md.
+# Patterns are anchored to the real provider-ERROR form, not the bare phrase, so
+# the scanner does not false-positive when a body echoes this table (or any code
+# discussing usage limits) into its logs. Only the log TAIL is scanned, because a
+# real availability error is terminal — it appears as the run aborts, after the
+# echoed brief and any source the body read. See _dispatch_scan_availability.
+AVAILABILITY_SCAN_TAIL_CHARS = 4000
 AVAILABILITY_SIGNATURES = [
-    {"id": "codex-usage-limit", "pattern": r"hit your usage limit", "reset": r"try again at ([^.\n]+)"},
-    {"id": "opencode-balance", "pattern": r"Insufficient balance", "reset": None},
+    {"id": "codex-usage-limit", "pattern": r"error\b.*?you'?ve hit your usage limit", "reset": r"try again at ([^.\n]+)"},
+    {"id": "opencode-balance", "pattern": r"error\b[:\s].*?insufficient balance", "reset": None},
 ]
 
 
@@ -797,6 +806,249 @@ def _smoke_probe(config_path: Path, now: datetime, executor_name: str | None, ti
     return (2 if fail else 0), "\n".join(lines)
 
 
+def _serve_state_dir(repo_path: Path) -> Path:
+    return repo_path / ".orchestrate" / "serve"
+
+
+def _serve_state_path(repo_path: Path) -> Path:
+    return _serve_state_dir(repo_path) / "opencode-serve.json"
+
+
+def _serve_load_state(state_path: Path) -> dict[str, Any] | None:
+    try:
+        text = state_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _serve_state_pid(state: dict[str, Any]) -> int | None:
+    pid = state.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        return pid
+    if isinstance(pid, str):
+        try:
+            parsed = int(pid.strip())
+        except ValueError:
+            return None
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _serve_state_port(state: dict[str, Any], fallback: int) -> int:
+    port = state.get("port")
+    if isinstance(port, int) and port > 0:
+        return port
+    if isinstance(port, str):
+        try:
+            parsed = int(port.strip())
+        except ValueError:
+            return fallback
+        if parsed > 0:
+            return parsed
+    return fallback
+
+
+def _serve_state_text(state: dict[str, Any], key: str, fallback: str = "") -> str:
+    value = state.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is not None:
+        normalized = _normalize_text(value)
+        if normalized:
+            return normalized
+    return fallback
+
+
+def _serve_process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    # Best-effort Windows liveness probe:
+    # OpenProcess + WaitForSingleObject avoids tasklist and does not rely on a
+    # held subprocess handle, but it can still be fooled by PID reuse.
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WAIT_TIMEOUT = 0x00000102
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _serve_force_kill(pid: int) -> None:
+    if os.name != "nt":
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return
+
+    PROCESS_TERMINATE = 0x0001
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if not handle:
+        return
+
+    try:
+        kernel32.TerminateProcess(handle, 1)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _serve_command(port: int, host: str, serve_cmd: str | None) -> tuple[list[str] | str, str]:
+    if serve_cmd is not None:
+        resolved = _dispatch_resolve_invoke_template(_normalize_text(serve_cmd))
+        return resolved, _dispatch_format_command(resolved)
+
+    opencode = shutil.which("opencode")
+    if opencode is None:
+        raise FileNotFoundError("opencode-not-found")
+
+    command = [opencode, "serve", "--port", str(port), "--hostname", host]
+    return command, _dispatch_format_command(command)
+
+
+def _serve_write_state(state_path: Path, *, pid: int, port: int, host: str, cmd: str) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": pid,
+        "port": port,
+        "host": host,
+        "started_at": _utc_isoformat_seconds(datetime.now(timezone.utc)),
+        "cmd": cmd,
+    }
+    state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _serve_start(repo_path: Path, port: int, host: str, serve_cmd: str | None) -> tuple[int, str]:
+    state_path = _serve_state_path(repo_path)
+    existing_state = _serve_load_state(state_path)
+    if existing_state is not None:
+        existing_pid = _serve_state_pid(existing_state)
+        if existing_pid is not None and _serve_process_alive(existing_pid):
+            existing_host = _serve_state_text(existing_state, "host", host)
+            existing_port = _serve_state_port(existing_state, port)
+            return 0, f"SERVE-ALREADY-RUNNING {existing_pid} on {existing_host}:{existing_port}"
+        try:
+            state_path.unlink()
+        except OSError:
+            pass
+
+    try:
+        command, command_text = _serve_command(port, host, serve_cmd)
+    except FileNotFoundError:
+        return 5, "SERVE-ABORTED opencode-not-found"
+
+    kwargs: dict[str, Any] = {
+        "cwd": repo_path,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "shell": isinstance(command, str),
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        process = subprocess.Popen(command, **kwargs)
+        _serve_write_state(state_path, pid=process.pid, port=port, host=host, cmd=command_text)
+    except OSError as exc:
+        return 1, f"SERVE-FAILED {exc}"
+
+    # TODO: once paid-model PONG probing is available, serve-status can verify
+    # the live endpoint as a health check instead of relying only on PID state.
+    return 0, f"SERVE-STARTED {process.pid} on {host}:{port}"
+
+
+def _serve_status(repo_path: Path, default_port: int = 4096, default_host: str = "127.0.0.1") -> tuple[int, str]:
+    state_path = _serve_state_path(repo_path)
+    state = _serve_load_state(state_path)
+    if state is None:
+        return 0, "SERVE-DOWN"
+
+    pid = _serve_state_pid(state)
+    if pid is None or not _serve_process_alive(pid):
+        try:
+            state_path.unlink()
+        except OSError:
+            pass
+        stale_pid = pid if pid is not None else _serve_state_text(state, "pid", "<unknown>")
+        return 0, f"SERVE-STALE {stale_pid}"
+
+    host = _serve_state_text(state, "host", default_host)
+    port = _serve_state_port(state, default_port)
+    started_at = _serve_state_text(state, "started_at", "unknown")
+    return 0, f"SERVE-UP {pid} on {host}:{port} (since {started_at})"
+
+
+def _serve_stop(repo_path: Path) -> tuple[int, str]:
+    state_path = _serve_state_path(repo_path)
+    state = _serve_load_state(state_path)
+    if state is None:
+        return 0, "SERVE-DOWN (nothing to stop)"
+
+    pid = _serve_state_pid(state)
+    if pid is None:
+        try:
+            state_path.unlink()
+        except OSError:
+            pass
+        return 0, "SERVE-STOPPED <unknown> (was not running)"
+
+    was_running = _serve_process_alive(pid)
+    if was_running:
+        try:
+            if os.name == "nt":
+                os.kill(pid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and _serve_process_alive(pid):
+            time.sleep(0.1)
+
+        if _serve_process_alive(pid):
+            _serve_force_kill(pid)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and _serve_process_alive(pid):
+                time.sleep(0.1)
+
+    try:
+        state_path.unlink()
+    except OSError:
+        pass
+
+    if was_running:
+        return 0, f"SERVE-STOPPED {pid}"
+    return 0, f"SERVE-STOPPED {pid} (was not running)"
+
+
 def _dispatch_resolve_invoke_template(invoke: str) -> list[str] | str:
     invoke_text = invoke.strip()
     needs_shell = (
@@ -834,9 +1086,13 @@ def _dispatch_scan_availability(logs_path: Path, run_dir: Path, executor: str) -
     except OSError:
         return None
 
+    # Scan only the tail: a real availability error is terminal (it appears as the
+    # run aborts), while echoed briefs and source the body read appear earlier.
+    scan_text = logs_text[-AVAILABILITY_SCAN_TAIL_CHARS:]
+
     for signature in AVAILABILITY_SIGNATURES:
         try:
-            if re.search(signature["pattern"], logs_text, re.IGNORECASE) is None:
+            if re.search(signature["pattern"], scan_text, re.IGNORECASE | re.DOTALL) is None:
                 continue
         except re.error:
             continue
@@ -845,7 +1101,7 @@ def _dispatch_scan_availability(logs_path: Path, run_dir: Path, executor: str) -
         reset_pattern = signature["reset"]
         if reset_pattern is not None:
             try:
-                reset_match = re.search(reset_pattern, logs_text, re.IGNORECASE)
+                reset_match = re.search(reset_pattern, scan_text, re.IGNORECASE)
             except re.error:
                 reset_match = None
             if reset_match is not None:
@@ -1317,6 +1573,18 @@ def _build_parser() -> argparse.ArgumentParser:
     worktree_prune_parser = subparsers.add_parser("worktree-prune", help="prune generated worktrees")
     worktree_prune_parser.add_argument("--repo", default=".", help="path to the repository root")
 
+    serve_start_parser = subparsers.add_parser("serve-start", help="start or attach to the opencode serve process")
+    serve_start_parser.add_argument("--repo", default=".", help="path to the repository root")
+    serve_start_parser.add_argument("--port", type=int, default=4096, help="port for opencode serve")
+    serve_start_parser.add_argument("--host", default="127.0.0.1", help="hostname for opencode serve")
+    serve_start_parser.add_argument("--serve-cmd", help="override the serve command")
+
+    serve_status_parser = subparsers.add_parser("serve-status", help="report opencode serve status")
+    serve_status_parser.add_argument("--repo", default=".", help="path to the repository root")
+
+    serve_stop_parser = subparsers.add_parser("serve-stop", help="stop the opencode serve process")
+    serve_stop_parser.add_argument("--repo", default=".", help="path to the repository root")
+
     dispatch_parser = subparsers.add_parser(
         "dispatch",
         help="validate, create a worktree, invoke an executor, and capture the diff",
@@ -1372,6 +1640,12 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, message = _remove_worktree(repo_path, Path(args.worktree).resolve(), args.force)
         elif args.command == "worktree-prune":
             exit_code, message = _prune_worktrees(repo_path)
+        elif args.command == "serve-start":
+            exit_code, message = _serve_start(repo_path, args.port, args.host, getattr(args, "serve_cmd", None))
+        elif args.command == "serve-status":
+            exit_code, message = _serve_status(repo_path)
+        elif args.command == "serve-stop":
+            exit_code, message = _serve_stop(repo_path)
         elif args.command == "dispatch":
             exit_code, message = _dispatch(
                 repo_path,

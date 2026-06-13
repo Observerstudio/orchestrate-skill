@@ -143,7 +143,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
         script = (
             "import pathlib,sys; "
             "pathlib.Path('availability-reset.txt').write_text('reset\\n', encoding='utf-8'); "
-            "print('You hit your usage limit. Please try again at 2026-06-13 10:00 UTC.')"
+            "print(\"ERROR: You've hit your usage limit. Try again at 2026-06-13 10:00 UTC.\")"
         )
 
         result = self._run_dispatch(brief_path, "--invoke-cmd", self._python_command(script))
@@ -174,7 +174,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
 
         logs_text = (run_dir / "logs.txt").read_text(encoding="utf-8")
         diff_text = (run_dir / "diff.patch").read_text(encoding="utf-8")
-        self.assertIn("You hit your usage limit", logs_text)
+        self.assertIn("You've hit your usage limit", logs_text)
         self.assertIn("availability-reset.txt", diff_text)
         self.assertEqual(
             result.stdout.strip().splitlines()[-4:],
@@ -197,7 +197,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
         script = (
             "import pathlib,sys; "
             "pathlib.Path('availability-unknown.txt').write_text('unknown\\n', encoding='utf-8'); "
-            "print('You hit your usage limit.')"
+            "print(\"ERROR: You've hit your usage limit.\")"
         )
 
         result = self._run_dispatch(brief_path, "--invoke-cmd", self._python_command(script))
@@ -228,7 +228,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
         script = (
             "import pathlib,sys; "
             "pathlib.Path('opencode-balance.txt').write_text('balance\\n', encoding='utf-8'); "
-            "print('Insufficient balance')"
+            "print('Error: Insufficient balance')"
         )
 
         result = self._run_dispatch(brief_path, "--invoke-cmd", self._python_command(script))
@@ -281,6 +281,34 @@ class DispatchAvailabilityTests(unittest.TestCase):
             ],
         )
 
+    def test_dispatch_does_not_false_positive_on_echoed_signature_table(self) -> None:
+        # Regression (selal-v2 #20 dispatch, 2026-06-13): the body was editing the
+        # harness itself and echoed the AVAILABILITY_SIGNATURES table — the bare phrase
+        # "hit your usage limit" — into its logs. The old loose pattern matched that as
+        # if it were a real provider error and spuriously aborted with exit 9.
+        brief_path = self._write_brief(
+            "dispatch-echoed-signature.md",
+            self._base_brief(
+                task_id="dispatch-echoed-signature",
+                body_note="echoed-signature-marker",
+            ),
+        )
+        script = (
+            "import pathlib; "
+            "pathlib.Path('echoed.txt').write_text('echoed\\n', encoding='utf-8'); "
+            "print('editing AVAILABILITY_SIGNATURES: pattern r\\\"hit your usage limit\\\", "
+            "reset r\\\"try again at\\\"'); "
+            "print('done, all tests pass')"
+        )
+
+        result = self._run_dispatch(brief_path, "--invoke-cmd", self._python_command(script))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("DISPATCHED", result.stdout)
+        worktree_path = self._parse_worktree_path(result.stdout)
+        self.addCleanup(self._force_remove_worktree, worktree_path)
+        run_dir = self._parse_run_dir(result.stdout)
+        self.assertFalse((run_dir / "availability.json").exists(), run_dir / "availability.json")
+
     def test_dispatch_usage_limit_overrides_timeout_and_keeps_evidence(self) -> None:
         brief_path = self._write_brief(
             "dispatch-usage-limit-timeout.md",
@@ -292,7 +320,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
         script = (
             "import pathlib,time; "
             "pathlib.Path('timeout-limit.txt').write_text('timeout\\n', encoding='utf-8'); "
-            "print('hit your usage limit', flush=True); "
+            "print(\"ERROR: You've hit your usage limit\", flush=True); "
             "time.sleep(2)"
         )
 
@@ -323,7 +351,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
             "import pathlib,sys; "
             "pathlib.Path('tracked.txt').write_text('worktree breach\\n', encoding='utf-8'); "
             f"pathlib.Path({repr(str(self.repo / 'tracked.txt'))}).write_text('repo breach\\n', encoding='utf-8'); "
-            "print('You hit your usage limit. Please try again at 2026-06-13 10:00 UTC.')"
+            "print(\"ERROR: You've hit your usage limit. Try again at 2026-06-13 10:00 UTC.\")"
         )
 
         result = self._run_dispatch(brief_path, "--invoke-cmd", self._python_command(script))
