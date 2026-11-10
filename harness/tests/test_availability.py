@@ -282,7 +282,7 @@ class DispatchAvailabilityTests(unittest.TestCase):
         )
 
     def test_dispatch_does_not_false_positive_on_echoed_signature_table(self) -> None:
-        # Regression (selal-v2 #20 dispatch, 2026-06-13): the body was editing the
+        # Regression (a production dispatch, 2026-06-13): the body was editing the
         # harness itself and echoed the AVAILABILITY_SIGNATURES table — the bare phrase
         # "hit your usage limit" — into its logs. The old loose pattern matched that as
         # if it were a real provider error and spuriously aborted with exit 9.
